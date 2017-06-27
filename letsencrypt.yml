@@ -1,0 +1,95 @@
+- name: Generate CRT File
+  hosts: localhost
+  gather_facts: true
+  tasks:
+    - stat: path=cert/{{ domain }}.key
+      register: key_file
+       
+    - shell: openssl genrsa 4096 > cert/{{ domain }}.key
+      when: key_file.stat.exists == False
+
+    - shell: openssl req -new -sha256 -key cert/{{ domain }}.key -subj "/CN={{ domain }}" > cert/{{ domain }}.csr
+      
+    - letsencrypt:
+        account_key: files/user.key
+        challenge: dns-01
+        csr: cert/{{domain}}.csr
+        dest: cert/{{domain}}.crt
+        acme_directory: https://acme-v01.api.letsencrypt.org/directory
+      register: challenge_result
+
+    - lineinfile:
+        path: /etc/bind/{{ dns_file }}
+        line: "_acme-challenge.{{ item.key }}. IN TXT {{ item.value['dns-01']['resource_value'] }}"
+      with_dict: "{{ challenge_result['challenge_data'] | default({}) }}"
+      delegate_to: ns1
+      when: challenge_result|changed
+
+    - shell: "grep Serial /etc/bind/{{ dns_file }}|cut -f2"
+      delegate_to: ns1
+      register: serial_old
+      when: challenge_result|changed
+
+    - shell: "echo \"{{ serial_old.stdout }}+1\" |bc"
+      register: serial_new
+      when: challenge_result|changed
+
+    - lineinfile:
+        path: /etc/bind/{{ dns_file }}
+        regexp: '(.*);Serial'
+        line: "\t{{ serial_new.stdout }}\t;Serial"
+        state: present
+        backup: yes
+      delegate_to: ns1
+      when: challenge_result|changed
+
+    - shell: rndc reload
+      delegate_to: ns1
+      when: challenge_result|changed
+
+    - pause: seconds=20
+
+    - letsencrypt:
+        account_key: files/user.key
+        challenge: dns-01
+        csr: cert/{{ domain }}.csr
+        dest: cert/{{ domain }}.crt
+        data: "{{ challenge_result }}"
+        acme_directory: https://acme-v01.api.letsencrypt.org/directory
+      when: challenge_result|changed
+
+    - lineinfile:
+        path: /etc/bind/{{ dns_file }}
+        state: absent
+        line: "_acme-challenge.{{ item.key }}. IN TXT {{ item.value['dns-01']['resource_value'] }}"
+      with_dict: "{{ challenge_result['challenge_data'] | default({}) }}"
+      delegate_to: ns1
+      when: challenge_result|changed
+
+    - shell: cat cert/{{ domain }}.crt cert/lets-encrypt-x3-cross-signed.pem cert/{{ domain }}.key > cert/{{ domain }}.all.pem
+      when: challenge_result|changed
+
+    - copy:
+        src: cert/{{ domain }}.all.pem
+        dest: /etc/haproxy/ssl/{{ domain }}.all.pem
+      delegate_to: rpin
+      when: challenge_result|changed and rpin is defined
+
+    - service:
+        name: haproxy
+        state: restarted
+      delegate_to: rpin
+      when: challenge_result|changed and rpin is defined
+
+    - copy:
+        src: cert/{{ domain }}.all.pem
+        dest: /etc/haproxy/ssl/{{ domain }}.all.pem
+      delegate_to: rpout
+      when: challenge_result|changed and rpout is defined
+
+    - service:
+        name: haproxy
+        state: restarted
+      delegate_to: rpout
+      when: challenge_result|changed and rpout is defined
+
